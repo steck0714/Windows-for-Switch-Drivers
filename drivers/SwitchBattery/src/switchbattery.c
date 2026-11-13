@@ -22,12 +22,22 @@
  *     (the same steps as UEFI R363ConfigureSink)
  * VBUS is never enabled while the partner supplies power (VSAFE or BQ
  * VBUS_STAT set). XUSB itself is left running by UEFI R378 in every case.
+ *
+ * v6: a USB stick plugged in directly stopped being seen after many
+ * plug-ins, until a reboot. The BQ boost stops on its own on an overload
+ * (inrush at plug-in) and stays off: REG09 BOOST_FAULT, REG08 VBUS_STAT no
+ * longer 3 (OTG), while REG01 still says OTG, so the state machine stayed in
+ * host with no VBUS. In host the driver now checks REG08/REG09 every poll;
+ * after 2 bad polls it turns the boost off and on again (REG01 charge, then
+ * OTG), at most 3 times in a row and then once every 5 s. When a partner is
+ * inserted but neither role is taken for 5 s, STATUS1/2 are traced.
  */
 #include <ntddk.h>
 #include <ntstrsafe.h>
 #include <wdf.h>
 #include <batclass.h>
 #include <spb.h>
+#include "usb_pd.h"
 
 #define GAUGE_REPSOC   0x06
 #define GAUGE_TEMP     0x08
@@ -43,6 +53,11 @@
 #define BM_COMMAND       0x05
 #define BM_READ_PDOS_SRC 0x08
 #define BM_CURRENT_PDO   0x28
+#define BM_CURRENT_RDO   0x2B
+#define BM_CONFIG1       0x06
+#define BM_VENDOR_CONFIG 0x1A
+#define BM_FW_TYPE       0x4B
+#define BM_FW_REV        0x4C
 #define BM_INSERT        (1u << 7)
 #define BM_VSAFE         (1u << 10)
 #define BM_SRC_MODE      (1u << 12)
@@ -57,7 +72,9 @@
 /* BQ24193 */
 #define BQ_INPUT_SRC     0x00
 #define BQ_PWR_ON        0x01
+#define BQ_CHARGE_CURRENT 0x02
 #define BQ_TERM_TIMER    0x05
+#define BQ_VENDOR_PART   0x0A
 #define BQ_HIZ           0x80u
 #define BQ_IINLIM_MASK   0x07u
 #define BQ_RESET_BITS    0xC0u
@@ -65,8 +82,20 @@
 #define BQ_MODE_CHARGE   0x10u
 #define BQ_MODE_OTG      0x20u
 #define BQ_WATCHDOG_MASK 0x30u
+#define BQ_TERMINATION_ENABLE 0x80u
+#define BQ_SAFETY_TIMER_ENABLE 0x08u
+#define BQ_SAFETY_TIMER_MASK 0x06u
+#define BQ_SAFETY_TIMER_8H 0x02u
+#define BQ_FORCE_20_PERCENT 0x01u
 #define USBC_POLL_MS     500
 #define USBC_STREAK      3
+#define BQ_FAULT         0x09
+#define BQ_BOOST_FAULT   0x40u
+#define BQ_VBUS_OTG      3u
+#define USBC_BOOST_BAD   2              /* bad polls before the boost is restarted */
+#define USBC_BOOST_QUICK 3              /* quick restarts, then one every USBC_BOOST_WAIT polls */
+#define USBC_BOOST_WAIT  10
+#define USBC_STUCK_POLLS 10
 
 typedef enum _USBC_STATE { UsbcIdle = 0, UsbcHost = 1, UsbcSink = 2 } USBC_STATE;
 
@@ -75,8 +104,10 @@ typedef struct _SWBAT_DEVICE {
     WDFIOTARGET Charger;
     WDFIOTARGET Pd;
     LARGE_INTEGER GaugeId, ChargerId, PdId;
-    ULONG Connections;
+    ULONG Connections, PdBoard;
+    BOOLEAN PdConfigured;
     WDFWAITLOCK Lock;
+    WDFWAITLOCK ClassLock;
     PVOID ClassHandle;
     WDFTIMER Timer;
     WDFTIMER UsbcTimer;
@@ -86,6 +117,8 @@ typedef struct _SWBAT_DEVICE {
     USBC_STATE Usbc;
     ULONG HostStreak, SinkStreak, GoneStreak;
     ULONG UsbcChanges;
+    ULONG BoostBad, BoostRestartsInRow, BoostWait, BoostRestarts;
+    ULONG StuckPolls;
 } SWBAT_DEVICE, *PSWBAT_DEVICE;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(SWBAT_DEVICE, SwBatGetDevice)
 
@@ -98,8 +131,10 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD SwBatEvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE SwBatEvtPrepareHardware;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT SwBatEvtSelfManagedIoInit;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND SwBatEvtSelfManagedIoSuspend;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART SwBatEvtSelfManagedIoRestart;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP SwBatEvtSelfManagedIoCleanup;
-EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL SwBatEvtIoDeviceControl;
+EVT_WDFDEVICE_WDM_IRP_PREPROCESS SwBatPreprocessDeviceControl;
 EVT_WDF_TIMER SwBatEvtTimer;
 EVT_WDF_TIMER SwBatEvtUsbcTimer;
 BCLASS_QUERY_TAG_CALLBACK SwBatQueryTag;
@@ -246,6 +281,51 @@ static VOID SwBatDisableBqWatchdog(PSWBAT_DEVICE Dev)
     }
 }
 
+/* BQ24193 datasheet sections 8.3.3.5/6 and REG05. Switchroot's charger
+ * framework enables EN_TERM later via charger_termination_configure(); this
+ * driver has no such software full-charge policy. Let the chip terminate on
+ * its programmed voltage/current criteria and enable its eight-hour safety
+ * timeout. This applies even when ACPI supplies no optional PD connection.
+ * Caller holds Dev->Lock. No charge/OTG mode, limits or JEITA setting changes.
+ */
+static NTSTATUS SwBatConfigureChargePolicy(PSWBAT_DEVICE Dev)
+{
+    UCHAR Part = 0, Current = 0, Timer = 0, Target = 0, Verify = 0;
+    ULONG Before = MAXULONG, After = MAXULONG;
+    NTSTATUS Status = STATUS_DEVICE_NOT_READY;
+    if (Dev->Charger == NULL) goto done;
+    Status = SwBatReadRegs(Dev->Charger, BQ_VENDOR_PART, &Part, 1);
+    if (!NT_SUCCESS(Status)) goto done;
+    if ((Part & 0x38u) != 0x28u) { Status = STATUS_NOT_SUPPORTED; goto done; }
+    Status = SwBatReadRegs(Dev->Charger, BQ_CHARGE_CURRENT, &Current, 1);
+    if (!NT_SUCCESS(Status)) goto done;
+    /* FORCE_20PCT requires software termination per TI. Do not increase its
+     * current limit or silently claim hardware termination in that mode.
+     */
+    if (Current & BQ_FORCE_20_PERCENT) { Status = STATUS_NOT_SUPPORTED; goto done; }
+    Status = SwBatReadRegs(Dev->Charger, BQ_TERM_TIMER, &Timer, 1);
+    if (!NT_SUCCESS(Status)) goto done;
+    Before = Timer;
+    Target = (UCHAR)((Timer & ~(BQ_WATCHDOG_MASK | BQ_SAFETY_TIMER_MASK)) |
+        BQ_TERMINATION_ENABLE | BQ_SAFETY_TIMER_ENABLE | BQ_SAFETY_TIMER_8H);
+    /* Do not rewrite an already configured timer on every resume. */
+    if (Target != Timer) {
+        Status = SwBatWrite8(Dev->Charger, BQ_TERM_TIMER, Target);
+        if (!NT_SUCCESS(Status)) goto done;
+    }
+    Status = SwBatReadRegs(Dev->Charger, BQ_TERM_TIMER, &Verify, 1);
+    if (NT_SUCCESS(Status)) {
+        After = Verify;
+        if (Verify != Target) Status = STATUS_DEVICE_DATA_ERROR;
+    }
+done:
+    /* Fixed initialization results, not a periodic diagnostic or log file. */
+    SwBatTrace(L"ChargeTimerBefore", Before);
+    SwBatTrace(L"ChargeTimerAfter", After);
+    SwBatTrace(L"ChargePolicyStatus", (ULONG)Status);
+    return Status;
+}
+
 static ULONG SwBatLe32(const UCHAR *P)
 {
     return (ULONG)P[0] | ((ULONG)P[1] << 8) | ((ULONG)P[2] << 16) | ((ULONG)P[3] << 24);
@@ -254,10 +334,10 @@ static ULONG SwBatLe32(const UCHAR *P)
 /* Charger hub attached: UEFI R363ConfigureSink. Caller holds Dev->Lock. */
 static NTSTATUS SwBatConfigureSink(PSWBAT_DEVICE Dev)
 {
-    static const ULONG Limits[8] = { 100, 150, 500, 900, 1200, 1500, 2000, 3000 };
-    UCHAR Pdos[29], Cur[5], In = 0;
+    UCHAR Pdos[29], Cur[5], Rdo[5], In = 0;
     USHORT Status1 = 0;
-    ULONG Pdo1 = 0, Pdo, Mv = 0, Ma = 0, LimitMa, Code, I;
+    ULONG Pdo1 = 0, Pdo, Mv = 0, Ma = 0, Operating = 0, Code, I;
+    unsigned LimitMa;
     BOOLEAN Contract = FALSE;
     NTSTATUS Status;
 
@@ -272,7 +352,7 @@ static NTSTATUS SwBatConfigureSink(PSWBAT_DEVICE Dev)
         if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &Status1)) && (Status1 & BM_SPDSNK) != 0 &&
             NT_SUCCESS(SwBatReadRegs(Dev->Pd, BM_CURRENT_PDO, Cur, sizeof(Cur)))) {
             Pdo = SwBatLe32(&Cur[1]);
-            if ((Pdo >> 30) == 0 && Pdo != 0) {
+            if ((Dev->PdBoard == SwBatErista || Cur[0] == 4) && (Pdo >> 30) == 0 && Pdo != 0) {
                 Mv = ((Pdo >> 10) & 0x3FF) * 50;
                 Ma = (Pdo & 0x3FF) * 10;
                 Contract = TRUE;
@@ -280,6 +360,12 @@ static NTSTATUS SwBatConfigureSink(PSWBAT_DEVICE Dev)
             }
         }
         SwBatSleepMs(500);
+    }
+    if (Contract && Dev->PdBoard == SwBatLite &&
+        NT_SUCCESS(SwBatReadRegs(Dev->Pd, BM_CURRENT_RDO, Rdo, sizeof(Rdo))) && Rdo[0] == 4) {
+        ULONG Requested = SwBatLe32(&Rdo[1]);
+        if (((Requested >> 28) & 7) != 0)
+            Operating = ((Requested >> 10) & 0x3FF) * 10;
     }
     SwBatTrace(L"UsbcContractMv", Mv);
     SwBatTrace(L"UsbcContractMa", Ma);
@@ -300,29 +386,53 @@ static NTSTATUS SwBatConfigureSink(PSWBAT_DEVICE Dev)
     }
     SwBatTrace(L"UsbcDataRole", (Status1 >> BM_DR_SHIFT) & 3);
 
-    /* Input current limit from the contract (L4T: 5/9 V 2 A, 12 V 1.5 A, 15 V 1.2 A). */
-    if (!Contract) {
-        LimitMa = 500;
-    } else if (Mv <= 9500) {
-        LimitMa = 2000;
-    } else if (Mv <= 12500) {
-        LimitMa = 1500;
-    } else if (Mv <= 15500) {
-        LimitMa = 1200;
-    } else {
-        LimitMa = 500;
-    }
-    if (Contract && Ma != 0 && Ma < LimitMa) {
-        LimitMa = Ma;
-    }
-    for (Code = 7; Code > 0 && Limits[Code] > LimitMa; --Code) {}
+    Code = SwBatCurrentCode(Dev->PdBoard, Contract ? Mv : 0, Ma, Operating, &LimitMa);
     Status = SwBatReadRegs(Dev->Charger, BQ_INPUT_SRC, &In, 1);
     if (NT_SUCCESS(Status)) {
         Status = SwBatWrite8(Dev->Charger, BQ_INPUT_SRC, (UCHAR)((In & ~(BQ_HIZ | BQ_IINLIM_MASK)) | Code));
     }
-    SwBatTrace(L"UsbcInputLimitMa", Limits[Code]);
+    if (NT_SUCCESS(Status)) SwBatTrace(L"UsbcInputLimitMa", LimitMa);
     SwBatDisableBqWatchdog(Dev);
     return Status;
+}
+
+/*
+ * v6: host with a partner inserted: is the BQ boost really giving VBUS?
+ * REG09 latches faults, so it is read every poll (the read clears it).
+ * Caller holds Dev->Lock.
+ */
+static VOID SwBatCheckBoost(PSWBAT_DEVICE Dev, UCHAR Sys)
+{
+    UCHAR Fault = 0;
+    BOOLEAN Bad;
+    NTSTATUS Status;
+
+    (VOID)SwBatReadRegs(Dev->Charger, BQ_FAULT, &Fault, 1);
+    Bad = ((Sys >> 6) & 3) != BQ_VBUS_OTG || (Fault & BQ_BOOST_FAULT) != 0;
+    if (!Bad) {
+        Dev->BoostBad = 0;
+        Dev->BoostRestartsInRow = 0;
+        Dev->BoostWait = 0;
+        return;
+    }
+    if (Dev->BoostWait != 0) {
+        Dev->BoostWait--;
+        return;
+    }
+    if (++Dev->BoostBad < USBC_BOOST_BAD) {
+        return;
+    }
+    Dev->BoostBad = 0;
+    SwBatTrace(L"UsbcBoostSysStat", Sys);
+    SwBatTrace(L"UsbcBoostFault", Fault);
+    (VOID)SwBatSetBqMode(Dev, BQ_MODE_CHARGE);
+    Status = SwBatSetBqMode(Dev, BQ_MODE_OTG);
+    SwBatDisableBqWatchdog(Dev);
+    SwBatTrace(L"UsbcBoostRestartStatus", (ULONG)Status);
+    SwBatTrace(L"UsbcBoostRestarts", ++Dev->BoostRestarts);
+    if (++Dev->BoostRestartsInRow >= USBC_BOOST_QUICK) {
+        Dev->BoostWait = USBC_BOOST_WAIT;       /* a real short: do not hammer the boost */
+    }
 }
 
 /* One 500 ms step of the role state machine. Caller holds Dev->Lock. */
@@ -338,21 +448,31 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
         Dev->HostStreak = Dev->SinkStreak = 0;
         return;
     }
-    (VOID)SwBatReadRegs(Dev->Charger, CHARGER_SYSSTAT, &Sys, 1);
+    if (!NT_SUCCESS(SwBatReadRegs(Dev->Charger, CHARGER_SYSSTAT, &Sys, 1))) {
+        Dev->HostStreak = Dev->SinkStreak = 0;
+        return;
+    }
     Inserted = (S1 & BM_INSERT) != 0;
     HostSeen = (S1 & (BM_INSERT | BM_SRC_MODE)) == (BM_INSERT | BM_SRC_MODE) && (S2 & BM_OTG_INSERT) != 0;
     SinkSeen = (S1 & (BM_INSERT | BM_VSAFE)) == (BM_INSERT | BM_VSAFE) && (S1 & BM_SRC_MODE) == 0 &&
-               ((S1 >> BM_DR_SHIFT) & 3) != BM_DR_DFP;
+               (Dev->PdBoard == SwBatLite || ((S1 >> BM_DR_SHIFT) & 3) != BM_DR_DFP);
     PartnerPower = ((Sys >> 6) & 3) == 1 || ((Sys >> 6) & 3) == 2;     /* BQ sees input power */
 
     switch (Dev->Usbc) {
     case UsbcIdle:
+        /* v6: inserted, but no role for a while: keep the PD state for the trace. */
+        Dev->StuckPolls = Inserted ? Dev->StuckPolls + 1 : 0;
+        if (Dev->StuckPolls == USBC_STUCK_POLLS) {
+            SwBatTrace(L"UsbcStuckStatus1", S1);
+            SwBatTrace(L"UsbcStuckStatus2", S2);
+            SwBatTrace(L"UsbcStuckSysStat", Sys);
+        }
         Dev->HostStreak = HostSeen ? Dev->HostStreak + 1 : 0;
         Dev->SinkStreak = SinkSeen ? Dev->SinkStreak + 1 : 0;
         if (Dev->SinkStreak >= USBC_STREAK) {
             Status = SwBatConfigureSink(Dev);
             SwBatTrace(L"UsbcSinkStatus", (ULONG)Status);
-            Dev->Usbc = UsbcSink;
+            if (NT_SUCCESS(Status)) Dev->Usbc = UsbcSink;
         } else if (Dev->HostStreak >= USBC_STREAK) {
             if ((S1 & BM_VSAFE) != 0 || PartnerPower) {
                 SwBatTrace(L"UsbcVbusRefused", S1);         /* the partner already powers VBUS */
@@ -363,6 +483,7 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
                 SwBatTrace(L"UsbcHostStatus", (ULONG)Status);
                 if (NT_SUCCESS(Status)) {
                     Dev->Usbc = UsbcHost;
+                    Dev->BoostBad = Dev->BoostRestartsInRow = Dev->BoostWait = 0;
                 }
             }
         }
@@ -372,10 +493,26 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
         Dev->GoneStreak = Inserted ? 0 : Dev->GoneStreak + 1;
         if (Dev->GoneStreak >= 2) {
             if (Dev->Usbc == UsbcHost) {
-                SwBatTrace(L"UsbcVbusOffStatus", (ULONG)SwBatSetBqMode(Dev, BQ_MODE_CHARGE));
+                Status = SwBatSetBqMode(Dev, BQ_MODE_CHARGE);
+                SwBatTrace(L"UsbcVbusOffStatus", (ULONG)Status);
+                if (!NT_SUCCESS(Status)) break;  /* keep ownership until the boost is off */
             }
             Dev->Usbc = UsbcIdle;
-            Dev->HostStreak = Dev->SinkStreak = Dev->GoneStreak = 0;
+            Dev->HostStreak = Dev->SinkStreak = Dev->GoneStreak = Dev->StuckPolls = 0;
+        } else if (Dev->PdBoard == SwBatLite && Dev->Usbc == UsbcSink && Inserted && HostSeen) {
+            Dev->Usbc = UsbcIdle; /* Debounce the new source role before driving VBUS. */
+            Dev->HostStreak = Dev->SinkStreak = 0;
+        } else if (Dev->Usbc == UsbcHost && Inserted) {
+            if (!HostSeen || PartnerPower) {
+                Status = SwBatSetBqMode(Dev, BQ_MODE_CHARGE);
+                SwBatTrace(L"UsbcVbusOffStatus", (ULONG)Status);
+                if (NT_SUCCESS(Status)) {
+                    Dev->Usbc = UsbcIdle;
+                    Dev->HostStreak = Dev->SinkStreak = 0;
+                }
+            } else {
+                SwBatCheckBoost(Dev, Sys);
+            }
         }
         break;
     }
@@ -387,6 +524,42 @@ static VOID SwBatUsbcPoll(PSWBAT_DEVICE Dev)
     }
 }
 
+/* Windows owns the Lite PD controller. The Lite loader initializes XUSB
+ * and leaves charger writes to this driver. Both source switches depend on
+ * the controller's over-current protection being enabled first. */
+static NTSTATUS SwBatPdClear(WDFIOTARGET Pd, UCHAR Reg, USHORT Mask)
+{
+    USHORT Before, After;
+    NTSTATUS Status = SwBatRead16(Pd, Reg, &Before);
+    if (!NT_SUCCESS(Status) || !(Before & Mask)) return Status;
+    USHORT Value = (USHORT)(Before & ~Mask);
+    UCHAR Buffer[2] = {(UCHAR)Value, (UCHAR)(Value >> 8)};
+    Status = SwBatWriteRegs(Pd, Reg, Buffer, sizeof(Buffer));
+    if (NT_SUCCESS(Status)) Status = SwBatRead16(Pd, Reg, &After);
+    return NT_SUCCESS(Status) && (After & Mask) ? STATUS_DEVICE_PROTOCOL_ERROR : Status;
+}
+
+static NTSTATUS SwBatConfigurePd(WDFDEVICE Device, PSWBAT_DEVICE Dev)
+{
+    WDFKEY Key;
+    DECLARE_CONST_UNICODE_STRING(Name, L"PdBoard");
+    NTSTATUS Status = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DRIVER,
+        KEY_QUERY_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &Key);
+    if (!NT_SUCCESS(Status)) return Status;
+    Status = WdfRegistryQueryULong(Key, &Name, &Dev->PdBoard);
+    WdfRegistryClose(Key);
+    if (!NT_SUCCESS(Status) || Dev->PdBoard == SwBatErista) return Status;
+    if (Dev->PdBoard != SwBatLite) return STATUS_DEVICE_CONFIGURATION_ERROR;
+    USHORT Type = 0, Rev = 0;
+    Status = SwBatRead16(Dev->Pd, BM_FW_TYPE, &Type);
+    if (NT_SUCCESS(Status)) Status = SwBatRead16(Dev->Pd, BM_FW_REV, &Rev);
+    if (!NT_SUCCESS(Status)) return Status;
+    if (Type != 0x0603 || Rev <= 0x0644 || Rev == 0xFFFF) return STATUS_NOT_SUPPORTED;
+    Status = SwBatPdClear(Dev->Pd, BM_VENDOR_CONFIG, (1u << 2));
+    if (NT_SUCCESS(Status)) Status = SwBatPdClear(Dev->Pd, BM_CONFIG1, (3u << 14));
+    return Status;
+}
+
 /* Start state: keep what UEFI set up (VBUS out = host). Caller holds Dev->Lock. */
 static VOID SwBatUsbcStart(PSWBAT_DEVICE Dev)
 {
@@ -394,9 +567,10 @@ static VOID SwBatUsbcStart(PSWBAT_DEVICE Dev)
     UCHAR Pwr = 0;
 
     Dev->Usbc = UsbcIdle;
+    Dev->HostStreak = Dev->SinkStreak = Dev->GoneStreak = Dev->StuckPolls = 0;
     if (NT_SUCCESS(SwBatReadRegs(Dev->Charger, BQ_PWR_ON, &Pwr, 1)) && (Pwr & BQ_MODE_MASK) == BQ_MODE_OTG) {
         Dev->Usbc = UsbcHost;                       /* GoneStreak turns VBUS off if nothing is there */
-    } else if (NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &S1)) && (S1 & BM_INSERT) != 0 &&
+    } else if (Dev->PdBoard == SwBatErista && NT_SUCCESS(SwBatRead16(Dev->Pd, BM_STATUS1, &S1)) && (S1 & BM_INSERT) != 0 &&
                (S1 & BM_SRC_MODE) == 0 && (S1 & BM_VSAFE) != 0) {
         Dev->Usbc = UsbcSink;                       /* UEFI R363 already configured charging */
     }
@@ -409,11 +583,11 @@ VOID SwBatEvtUsbcTimer(WDFTIMER Timer)
 {
     PSWBAT_DEVICE Dev = SwBatGetDevice(SwBatGetTimer(Timer)->Device);
     WdfWaitLockAcquire(Dev->Lock, NULL);
-    SwBatUsbcPoll(Dev);
-    WdfWaitLockRelease(Dev->Lock);
     if (!Dev->Stopping) {
-        WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(USBC_POLL_MS));    /* one-shot timer, re-armed */
+        SwBatUsbcPoll(Dev);
+        WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(USBC_POLL_MS));
     }
+    WdfWaitLockRelease(Dev->Lock);
 }
 
 /* Read gauge + charger into a BATTERY_STATUS. Caller holds Dev->Lock. */
@@ -587,19 +761,21 @@ VOID SwBatEvtTimer(WDFTIMER Timer)
     BOOLEAN Changed = FALSE;
 
     WdfWaitLockAcquire(Dev->Lock, NULL);
+    if (Dev->Stopping) {
+        WdfWaitLockRelease(Dev->Lock);
+        return;
+    }
     if (NT_SUCCESS(SwBatReadStatus(Dev, &Now))) {
         Changed = (Now.PowerState != Dev->Last.PowerState) || (Now.Capacity != Dev->Last.Capacity);
         SwBatTrace(L"LastPowerState", Now.PowerState);
         SwBatTrace(L"LastCapacity", Now.Capacity);
         SwBatTrace(L"LastVoltage", Now.Voltage);
     }
+    WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));
     WdfWaitLockRelease(Dev->Lock);
     SwBatTrace(L"TimerRuns", (ULONG)InterlockedIncrement(&Dev->TimerRuns));
     if (Changed && Dev->ClassHandle != NULL) {
         (VOID)BatteryClassStatusNotify(Dev->ClassHandle);
-    }
-    if (!Dev->Stopping) {
-        WdfTimerStart(Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));    /* one-shot timer, re-armed */
     }
 }
 
@@ -677,10 +853,12 @@ NTSTATUS SwBatEvtSelfManagedIoInit(WDFDEVICE Device)
     Info.DisableStatusNotify = SwBatDisableStatusNotify;
     Info.Pdo = WdfDeviceWdmGetPhysicalDevice(Device);
     Info.DeviceName = NULL;
+    WdfWaitLockAcquire(Dev->ClassLock, NULL);
     Status = BatteryClassInitializeDevice(&Info, &Dev->ClassHandle);
+    if (!NT_SUCCESS(Status)) Dev->ClassHandle = NULL;
+    WdfWaitLockRelease(Dev->ClassLock);
     SwBatTrace(L"ClassInitStatus", (ULONG)Status);
     if (!NT_SUCCESS(Status)) {
-        Dev->ClassHandle = NULL;
         return Status;
     }
 
@@ -704,20 +882,12 @@ NTSTATUS SwBatEvtSelfManagedIoInit(WDFDEVICE Device)
             Dev->Timer = NULL;
         }
     }
-    Dev->Stopping = FALSE;
-    if (Dev->Timer != NULL) {
-        WdfTimerStart(Dev->Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));
-    }
-
     /* v4: USB-C role switching, only with the BM92T connection (R378+) and the charger. */
     if (Dev->Connections >= 3 && Dev->Charger != NULL && Dev->Pd == NULL) {
         Status = SwBatOpenTarget(Device, Dev->PdId, &Dev->Pd);
         SwBatTrace(L"OpenPdStatus", (ULONG)Status);
     }
     if (Dev->Pd != NULL) {
-        WdfWaitLockAcquire(Dev->Lock, NULL);
-        SwBatUsbcStart(Dev);
-        WdfWaitLockRelease(Dev->Lock);
         if (Dev->UsbcTimer == NULL) {
             WDF_TIMER_CONFIG TimerConfig;
             WDF_OBJECT_ATTRIBUTES Attributes;
@@ -734,9 +904,52 @@ NTSTATUS SwBatEvtSelfManagedIoInit(WDFDEVICE Device)
                 Dev->UsbcTimer = NULL;
             }
         }
-        if (Dev->UsbcTimer != NULL) {
+    }
+    return SwBatEvtSelfManagedIoRestart(Device);
+}
+
+NTSTATUS SwBatEvtSelfManagedIoRestart(WDFDEVICE Device)
+{
+    PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
+    WdfWaitLockAcquire(Dev->Lock, NULL);
+    /* Keep gauge reporting available if the optional charger is inaccessible;
+     * ChargePolicyStatus records the failure instead of claiming it applied.
+     */
+    (VOID)SwBatConfigureChargePolicy(Dev);
+    Dev->Stopping = FALSE;
+    if (Dev->Timer != NULL) WdfTimerStart(Dev->Timer, WDF_REL_TIMEOUT_IN_MS(POLL_MS));
+    if (Dev->Pd != NULL && Dev->UsbcTimer != NULL) {
+        NTSTATUS Status = SwBatConfigurePd(Device, Dev);
+        Dev->PdConfigured = NT_SUCCESS(Status);
+        SwBatTrace(L"UsbcSetupStatus", (ULONG)Status);
+        if (Dev->PdConfigured) {
+            SwBatUsbcStart(Dev);
             WdfTimerStart(Dev->UsbcTimer, WDF_REL_TIMEOUT_IN_MS(USBC_POLL_MS));
         }
+    }
+    WdfWaitLockRelease(Dev->Lock);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS SwBatEvtSelfManagedIoSuspend(WDFDEVICE Device)
+{
+    PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
+    WdfWaitLockAcquire(Dev->Lock, NULL);
+    Dev->Stopping = TRUE;
+    WdfWaitLockRelease(Dev->Lock);
+    if (Dev->Timer != NULL) {
+        WdfTimerStop(Dev->Timer, TRUE);
+    }
+    if (Dev->UsbcTimer != NULL) {
+        WdfTimerStop(Dev->UsbcTimer, TRUE);
+    }
+    /* Switch the Lite back to charge mode while the I2C bus is still in D0. */
+    if (Dev->PdConfigured && Dev->PdBoard == SwBatLite && Dev->Usbc == UsbcHost) {
+        WdfWaitLockAcquire(Dev->Lock, NULL);
+        NTSTATUS Status = SwBatSetBqMode(Dev, BQ_MODE_CHARGE);
+        SwBatTrace(L"UsbcSuspendVbusStatus", (ULONG)Status);
+        if (NT_SUCCESS(Status)) Dev->Usbc = UsbcIdle;
+        WdfWaitLockRelease(Dev->Lock);
     }
     return STATUS_SUCCESS;
 }
@@ -744,41 +957,40 @@ NTSTATUS SwBatEvtSelfManagedIoInit(WDFDEVICE Device)
 VOID SwBatEvtSelfManagedIoCleanup(WDFDEVICE Device)
 {
     PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
-    Dev->Stopping = TRUE;
-    if (Dev->Timer != NULL) {
-        WdfTimerStop(Dev->Timer, TRUE);
-    }
-    if (Dev->UsbcTimer != NULL) {
-        WdfTimerStop(Dev->UsbcTimer, TRUE);
-    }
+    WdfWaitLockAcquire(Dev->ClassLock, NULL);
     if (Dev->ClassHandle != NULL) {
         (VOID)BatteryClassUnload(Dev->ClassHandle);
         Dev->ClassHandle = NULL;
     }
+    WdfWaitLockRelease(Dev->ClassLock);
 }
 
-VOID SwBatEvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request, size_t OutputLength, size_t InputLength, ULONG IoControlCode)
+NTSTATUS SwBatPreprocessDeviceControl(WDFDEVICE Device, PIRP Irp)
 {
-    PSWBAT_DEVICE Dev = SwBatGetDevice(WdfIoQueueGetDevice(Queue));
+    PSWBAT_DEVICE Dev = SwBatGetDevice(Device);
     NTSTATUS Status = STATUS_NOT_SUPPORTED;
-    UNREFERENCED_PARAMETER(OutputLength);
-    UNREFERENCED_PARAMETER(InputLength);
-    UNREFERENCED_PARAMETER(IoControlCode);
 
+    /* battc owns and completes handled IRPs, including pending status waits.
+     * Give it the IRP before KMDF creates a WDFREQUEST: completing the WDM IRP
+     * from EvtIoDeviceControl leaves the framework queue waiting at power-down.
+     * ClassLock is separate from Lock because battc calls our I2C callbacks.
+     */
+    WdfWaitLockAcquire(Dev->ClassLock, NULL);
     if (Dev->ClassHandle != NULL) {
-        /* battc completes the IRP itself unless it does not handle it. */
-        Status = BatteryClassIoctl(Dev->ClassHandle, WdfRequestWdmGetIrp(Request));
+        Status = BatteryClassIoctl(Dev->ClassHandle, Irp);
     }
+    WdfWaitLockRelease(Dev->ClassLock);
     if (Status == STATUS_NOT_SUPPORTED) {
-        WdfRequestComplete(Request, Status);
+        IoSkipCurrentIrpStackLocation(Irp);
+        Status = WdfDeviceWdmDispatchPreprocessedIrp(Device, Irp);
     }
+    return Status;
 }
 
 NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 {
     WDF_PNPPOWER_EVENT_CALLBACKS Pnp;
     WDF_OBJECT_ATTRIBUTES Attributes;
-    WDF_IO_QUEUE_CONFIG QueueConfig;
     WDFDEVICE Device;
     PSWBAT_DEVICE Dev;
     NTSTATUS Status;
@@ -787,8 +999,13 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&Pnp);
     Pnp.EvtDevicePrepareHardware = SwBatEvtPrepareHardware;
     Pnp.EvtDeviceSelfManagedIoInit = SwBatEvtSelfManagedIoInit;
+    Pnp.EvtDeviceSelfManagedIoSuspend = SwBatEvtSelfManagedIoSuspend;
+    Pnp.EvtDeviceSelfManagedIoRestart = SwBatEvtSelfManagedIoRestart;
     Pnp.EvtDeviceSelfManagedIoCleanup = SwBatEvtSelfManagedIoCleanup;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &Pnp);
+    Status = WdfDeviceInitAssignWdmIrpPreprocessCallback(DeviceInit,
+        SwBatPreprocessDeviceControl, IRP_MJ_DEVICE_CONTROL, NULL, 0);
+    if (!NT_SUCCESS(Status)) return Status;
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attributes, SWBAT_DEVICE);
     Status = WdfDeviceCreate(&DeviceInit, &Attributes, &Device);
@@ -796,14 +1013,14 @@ NTSTATUS SwBatEvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
         return Status;
     }
     Dev = SwBatGetDevice(Device);
-    Status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &Dev->Lock);
+    WDF_OBJECT_ATTRIBUTES_INIT(&Attributes);
+    Attributes.ParentObject = Device;
+    Status = WdfWaitLockCreate(&Attributes, &Dev->Lock);
     if (!NT_SUCCESS(Status)) {
         return Status;
     }
 
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&QueueConfig, WdfIoQueueDispatchParallel);
-    QueueConfig.EvtIoDeviceControl = SwBatEvtIoDeviceControl;
-    return WdfIoQueueCreate(Device, &QueueConfig, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+    return WdfWaitLockCreate(&Attributes, &Dev->ClassLock);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -815,7 +1032,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         RtlCopyMemory(&SwBatParamsPath[RegistryPath->Length / sizeof(WCHAR)], L"\\Parameters", sizeof(L"\\Parameters"));
         (VOID)RtlCreateRegistryKey(RTL_REGISTRY_ABSOLUTE, SwBatParamsPath);
     }
-    SwBatTrace(L"DriverVersion", 5);
+    SwBatTrace(L"DriverVersion", 11);
 
     WDF_DRIVER_CONFIG_INIT(&Config, SwBatEvtDeviceAdd);
     return WdfDriverCreate(DriverObject, RegistryPath, WDF_NO_OBJECT_ATTRIBUTES, &Config, WDF_NO_HANDLE);
