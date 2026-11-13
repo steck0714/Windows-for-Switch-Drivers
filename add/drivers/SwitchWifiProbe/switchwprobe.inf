@@ -1,0 +1,55 @@
+;
+; switchwprobe.inf (renamed from hayato41200 switchwifi.inf 0.4.0; Erista probe, kept separate from the Lite switchwifi) - Nintendo Switch Wi-Fi (BCM4356 on PCIe), stage 2a probe
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Mfg%
+CatalogFile = switchwprobe.cat
+DriverVer   = 11/07/2026,0.4.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+switchwprobe.sys = 1
+
+[Manufacturer]
+%Mfg% = Std, NTarm64
+
+[Std.NTarm64]
+%DeviceDesc% = SwWifi_Inst, ACPI\SWOA0D01
+
+[SwWifi_Inst.NT]
+CopyFiles = SwWifi_Copy
+
+[SwWifi_Copy]
+switchwprobe.sys
+
+[SwWifi_Inst.NT.Services]
+AddService = switchwprobe, 0x00000002, SwWifi_Service
+
+[SwWifi_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\switchwprobe.sys
+
+[SwWifi_Inst.NT.Wdf]
+KmdfService = switchwprobe, SwWifi_WdfSection
+
+[SwWifi_WdfSection]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+Mfg         = "SwitchWOA"
+DiskName    = "SwitchWOA Wi-Fi"
+DeviceDesc  = "Nintendo Switch Wi-Fi (BCM4356, probe)"
+ServiceDesc = "Nintendo Switch Wi-Fi probe (Erista, 0.4.0)"
